@@ -1,4 +1,4 @@
-const V = 'selam-v1';
+const V = 'selam-v2';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -20,4 +20,13 @@ self.addEventListener('fetch', e => {
 self.addEventListener('notificationclick', e => {
   e.notification.close();
   e.waitUntil(self.clients.matchAll({ type: 'window' }).then(l => (l.length ? l[0].focus() : self.clients.openWindow('/'))));
+});
+
+self.addEventListener('push', e => {
+  let d = {}; try { d = e.data.json(); } catch {}
+  const call = d.t === 'call';
+  e.waitUntil(self.registration.showNotification(d.title || 'Selam', {
+    body: d.body || '', icon: '/icon-192.png', badge: '/icon-192.png', tag: d.tag || 'selam', renotify: true,
+    requireInteraction: call, vibrate: call ? [400, 200, 400, 200, 400] : [120],
+  }));
 });
