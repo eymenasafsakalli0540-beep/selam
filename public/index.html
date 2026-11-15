@@ -407,6 +407,7 @@ $('stepName').onsubmit = async e => {
 };
 async function doLogout() {
   if (!confirm('Çıkış yapılsın mı? Tekrar girmek için e-postana kod gelecek.')) return;
+  try { const sub = await (await navigator.serviceWorker.ready).pushManager.getSubscription(); if (sub) await api('/push/unsubscribe', { endpoint: sub.endpoint }); } catch {}
   try { await api('/auth/logout', {}); } catch {}
   LS.del('selam_token'); location.reload();
 }
@@ -425,7 +426,7 @@ async function boot() {
 function start() {
   $('splash').classList.add('hidden'); $('auth').classList.add('hidden'); $('app').classList.remove('hidden');
   $('meName').textContent = '@' + user.username;
-  loadChats(); connect(); setupBanners(); handleInvite().then(handleShare);
+  loadChats(); connect(); setupBanners(); handleInvite().then(handleShare); subscribePush();
 }
 // Davet linki: https://site/?u=kullanici -> giriş yapınca o kişiyle sohbet açılır
 async function handleInvite() {
@@ -1110,7 +1111,7 @@ async function startCall() {
     const offer = await c.pc.createOffer(); await c.pc.setLocalDescription(offer);
     if (call !== c) return;
     wsSend({ type: 'call', kind: 'offer', callId: c.id, to: c.peer.id, sdp: { type: offer.type, sdp: offer.sdp } });
-    ring(true, 380, 3000); c.timeout = setTimeout(() => endCall(true), 45000);
+    ring(true, 380, 3000); c.timeout = setTimeout(() => endCall(true), 58000);
   } catch (e) { toast(e.message || 'Arama başlatılamadı'); if (call === c) endCall(false); }
 }
 async function acceptCall() {
@@ -1133,6 +1134,7 @@ function notifyText(title, body) {
 async function onCallSignal(d) {
   const k = d.kind;
   if (k === 'offer') {
+    if (call && call.id === d.callId) return;  // aynı arama yeniden iletildi
     if (call) return wsSend({ type: 'call', kind: 'busy', callId: d.callId });
     const c = call = { id: d.callId, peer: d.fromUser, role: 'callee', state: 'ringing', offer: d.sdp, pendingIce: [] };
     showCall(); ring(true, 560, 1800);
@@ -1156,6 +1158,18 @@ async function onCallSignal(d) {
 $('callBtn').onclick = startCall;
 
 // ---------- Bildirim, yükleme önerisi ----------
+// Uygulama kapalıyken bildirim / çalan arama (Web Push). Sunucuda push kapalıysa sessizce atlanır.
+async function subscribePush() {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || Notification.permission !== 'granted') return;
+    const reg = await navigator.serviceWorker.ready, k = await api('/push/key');
+    const b64 = (k.key + '='.repeat((4 - k.key.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+    const key = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    await api('/push/subscribe', { sub: sub.toJSON() });
+  } catch {}
+}
 function notify(u, m) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   const title = '@' + (u ? u.username : 'Selam'), body = previewOf(m);
@@ -1177,7 +1191,7 @@ function setupBanners() {
   $('banners').innerHTML = '';
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
   if ('Notification' in window && Notification.permission === 'default')
-    addBanner('Yeni mesajlarda bildirim alalım mı?', 'Aç', () => Notification.requestPermission(), 'notif');
+    addBanner('Uygulama kapalıyken de mesaj ve aramalar için bildirim alalım mı?', 'Aç', () => Notification.requestPermission().then(subscribePush), 'notif');
   if (!standalone) {
     if (installEvt) addBanner('Selam\'ı uygulama olarak yükle.', 'Yükle', () => installEvt.prompt(), 'install');
     else if (/iphone|ipad|ipod/i.test(navigator.userAgent)) addBanner('iPhone\'a yüklemek için Paylaş ▸ "Ana Ekrana Ekle" de.', null, null, 'ios');
