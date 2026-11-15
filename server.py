@@ -18,6 +18,13 @@ from email.utils import parseaddr
 from pathlib import Path
 
 import uvicorn
+try:  # uygulama kapalıyken bildirim/arama için (yoksa sadece o özellik kapanır)
+    from pywebpush import webpush, WebPushException
+    from py_vapid import Vapid
+    from cryptography.hazmat.primitives import serialization as _ser
+    PUSH_OK = True
+except Exception:
+    PUSH_OK = False
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -174,8 +181,30 @@ def load_db():
 
 load_db()
 db.setdefault("reports", [])
+db.setdefault("push", {})  # kullanıcı id -> [abonelik, ...]
+
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+if PUSH_OK:
+    try:
+        if not db.get("vapid"):
+            _v = Vapid(); _v.generate_keys()
+            db["vapid"] = {
+                "priv": _b64u(_v.private_key.private_numbers().private_value.to_bytes(32, "big")),
+                "pub": _b64u(_v.public_key.public_bytes(_ser.Encoding.X962, _ser.PublicFormat.UncompressedPoint)),
+            }
+            dirty_boot = True
+    except Exception as _e:
+        print("Push anahtarı üretilemedi, push kapalı:", _e, flush=True)
+        PUSH_OK = False
+PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com", "notify.windows.com", "push.services.mozilla.org") \
+    + tuple(h for h in os.environ.get("PUSH_EXTRA_HOSTS", "").split(",") if h)
+VAPID_SUB = os.environ.get("VAPID_SUB") or ("mailto:" + (os.environ.get("ADMIN_EMAIL") or "selam@example.com"))
 users_by_id = {u["id"]: u for u in db["users"]}
-dirty = False
+dirty = "dirty_boot" in globals()
 
 
 def mark():
@@ -955,6 +984,87 @@ async def cleanup_old():
     print(f"Temizlik: {len(gone)} eski mesaj silindi", flush=True)
 
 
+# ---------- Push (uygulama kapalıyken bildirim / arama çalması) ----------
+def push_host_ok(url: str) -> bool:
+    try:
+        u = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if u.scheme != "https" and not (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost") and os.environ.get("PUSH_EXTRA_HOSTS")):
+        return False
+    h = (u.hostname or "").lower()
+    return any(h == x or h.endswith("." + x) for x in PUSH_HOSTS)
+
+
+async def push_to(uid, payload: dict):
+    subs = list(db["push"].get(uid) or [])
+    if not PUSH_OK or not subs:
+        return
+    data = json.dumps(payload, ensure_ascii=False)
+    keys = db["vapid"]
+
+    def one(sub):
+        try:
+            webpush(subscription_info=sub, data=data, vapid_private_key=keys["priv"], vapid_claims={"sub": VAPID_SUB}, ttl=60)
+            return True
+        except WebPushException as e:
+            st = getattr(getattr(e, "response", None), "status_code", None)
+            if st not in (404, 410):
+                print("Push gönderilemedi:", e, flush=True)
+            return st not in (404, 410)
+        except Exception as e:
+            print("Push hatası:", e, flush=True)
+            return True
+
+    dead = [sub for sub in subs if not await asyncio.to_thread(one, sub)]
+    if dead:
+        db["push"][uid] = [x for x in db["push"].get(uid, []) if x not in dead]
+        mark()
+
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    bg_tasks.add(t)
+    t.add_done_callback(bg_tasks.discard)
+
+
+@app.get("/api/push/key")
+async def push_key(request: Request):
+    require_auth(request)
+    if not PUSH_OK:
+        raise HTTPException(404, "Push kapalı")
+    return {"key": db["vapid"]["pub"]}
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request):
+    user = require_auth(request)
+    if not PUSH_OK:
+        raise HTTPException(404, "Push kapalı")
+    sub = (await body_of(request)).get("sub")
+    try:
+        ep, k = sub["endpoint"], sub["keys"]
+        assert isinstance(ep, str) and len(ep) < 1000 and isinstance(k["p256dh"], str) and isinstance(k["auth"], str)
+        assert push_host_ok(ep)
+    except Exception:
+        raise HTTPException(400, "Geçersiz abonelik")
+    clean = {"endpoint": ep, "keys": {"p256dh": k["p256dh"][:200], "auth": k["auth"][:100]}}
+    lst = [x for x in db["push"].get(user["id"], []) if x["endpoint"] != ep]
+    lst.append(clean)
+    db["push"][user["id"]] = lst[-5:]
+    mark()
+    return {"ok": True}
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(request: Request):
+    user = require_auth(request)
+    ep = (await body_of(request)).get("endpoint")
+    db["push"][user["id"]] = [x for x in db["push"].get(user["id"], []) if x["endpoint"] != ep]
+    mark()
+    return {"ok": True}
+
+
 # ---------- WebSocket ----------
 async def send_to(uid, payload: dict, exclude=None):
     s = json.dumps(payload, ensure_ascii=False)
@@ -1037,13 +1147,18 @@ async def handle_call(user, ws, data):
         if not has_history(uid, to["id"]):  # istenmeyen aramaları önlemek için önce mesajlaşmış olmak gerekir
             await send_to(uid, {"type": "call", "kind": "denied", "callId": cid})
             return
-        calls[cid] = {"from": uid, "to": to["id"], "ts": now_ms(), "answered": None}
+        calls[cid] = {"from": uid, "to": to["id"], "ts": now_ms(), "answered": None, "sdp": sdp}
         if not online.get(to["id"]):
-            await finish_call(cid, "unavailable")
-            await send_to(uid, {"type": "call", "kind": "unavailable", "callId": cid})
-            return
-        await send_to(to["id"], {"type": "call", "kind": "offer", "callId": cid, "from": uid,
-                                 "fromUser": pub(user), "sdp": sdp})
+            if not (PUSH_OK and db["push"].get(to["id"])):
+                await finish_call(cid, "unavailable")
+                await send_to(uid, {"type": "call", "kind": "unavailable", "callId": cid})
+                return
+            # Uygulaması kapalı: telefonuna bildirim gider, açarsa arama hâlâ çalıyor (60 sn)
+            spawn(push_to(to["id"], {"t": "call", "title": "📞 @" + user["username"] + " arıyor",
+                                     "body": "Cevaplamak için dokun", "tag": "selam-call"}))
+        else:
+            await send_to(to["id"], {"type": "call", "kind": "offer", "callId": cid, "from": uid,
+                                     "fromUser": pub(user), "sdp": sdp})
         t = asyncio.create_task(ring_timeout(cid))
         bg_tasks.add(t)
         t.add_done_callback(bg_tasks.discard)
@@ -1110,6 +1225,10 @@ async def ws_endpoint(ws: WebSocket):
             await send_to(sid, {"type": "delivered", "ids": ids})
     if first:
         await broadcast_presence(user)
+    for cid, c in list(calls.items()):  # uygulamayı bildirimden açtıysa çalan aramayı göster
+        if c["to"] == uid and not c["answered"] and c.get("sdp") and c["from"] in users_by_id:
+            await ws.send_text(json.dumps({"type": "call", "kind": "offer", "callId": cid, "from": c["from"],
+                                           "fromUser": pub(users_by_id[c["from"]]), "sdp": c["sdp"]}, ensure_ascii=False))
 
     bucket, cbucket, window_start = 0, 0, time.time()
     try:
@@ -1192,6 +1311,9 @@ async def ws_endpoint(ws: WebSocket):
                 await send_to(uid, {"type": "message", "msg": msg, "fromUser": pub(user)})
                 if not blocked_me:
                     await send_to(to["id"], {"type": "message", "msg": msg, "fromUser": pub(user)})
+                    if not online.get(to["id"]) and PUSH_OK and db["push"].get(to["id"]):
+                        prev = (text[:100] or ("📷 Fotoğraf" if img else "📄 " + fl["name"] if fl else "📍 Konum"))
+                        spawn(push_to(to["id"], {"t": "msg", "title": "@" + user["username"], "body": prev, "tag": "selam-" + uid}))
 
             elif kind == "react":
                 m = next((x for x in reversed(db["messages"]) if x["id"] == data.get("id")), None)
