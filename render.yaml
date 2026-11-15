@@ -1,0 +1,17 @@
+# Render "Blueprint": Render'da New > Blueprint diyip bu depoyu seçersen ayarları buradan okur.
+# sync:false olanları (gizli bilgiler) oluştururken senden ister.
+services:
+  - type: web
+    name: selam
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: APPSCRIPT_URL
+        sync: false
+      - key: APPSCRIPT_SECRET
+        sync: false
