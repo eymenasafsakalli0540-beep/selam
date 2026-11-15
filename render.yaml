@@ -1,0 +1,21 @@
+# Render "Blueprint": Render'da New > Blueprint diyip bu depoyu seçersen ayarları buradan okur.
+# sync:false olanları (gizli bilgiler) oluştururken senden ister.
+services:
+  - type: web
+    name: selam
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      - key: MAIL_FROM
+        sync: false
