@@ -1222,6 +1222,7 @@ async function onCallSignal(d) {
   } else if (k === 'ice') {
     if (call.pc && call.pc.remoteDescription) call.pc.addIceCandidate(d.candidate).catch(() => {}); else call.pendingIce.push(d.candidate);
   } else if (k === 'taken') { endCall(false); }
+  else if (k === 'waiting') { toast('Kişi şu an çevrimdışı. Uygulamayı açtığında araman çalacak.'); return; }
   else {
     const msg = { end: 'Arama sona erdi', reject: 'Arama reddedildi', busy: 'Kişi başka bir aramada', unavailable: 'Kişi çevrimdışı, cevapsız arama olarak kaydedildi', denied: 'Bu kişi şu an aranamıyor (önce mesajlaşmış olmanız gerekir)' }[k];
     if (msg && !(k === 'end' && call.state === 'active')) toast(msg);
