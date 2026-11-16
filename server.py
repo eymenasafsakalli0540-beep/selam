@@ -1022,6 +1022,17 @@ async def push_to(uid, payload: dict):
         mark()
 
 
+hidden_ws = set()  # arka plandaki (görünmeyen) bağlantılar
+
+
+def visible(uid) -> bool:
+    return any(c not in hidden_ws for c in online.get(uid, ()))
+
+
+def can_push(uid) -> bool:
+    return bool(PUSH_OK and db["push"].get(uid))
+
+
 def spawn(coro):
     t = asyncio.create_task(coro)
     bg_tasks.add(t)
@@ -1053,6 +1064,15 @@ async def push_subscribe(request: Request):
     lst.append(clean)
     db["push"][user["id"]] = lst[-5:]
     mark()
+    return {"ok": True}
+
+
+@app.post("/api/push/test")
+async def push_test(request: Request):
+    user = require_auth(request)
+    if not can_push(user["id"]):
+        raise HTTPException(404, "Bu cihaz bildirim için kayıtlı değil")
+    spawn(push_to(user["id"], {"t": "msg", "title": "Selam", "body": "Bildirimler çalışıyor ✅", "tag": "selam-test"}))
     return {"ok": True}
 
 
@@ -1116,7 +1136,7 @@ async def finish_call(cid, reason, by=None):
         status, dur = "missed", 0
     msg = {"id": new_id(), "from": c["from"], "to": c["to"], "text": "", "ts": now_ms(),
            "dl": bool(online.get(c["to"])), "rd": status != "missed", "del": False,
-           "call": {"status": status, "dur": dur}}
+           "call": {"status": status, "dur": dur, "video": bool(c.get("video"))}}
     db["messages"].append(msg)
     mark()
     payload = {"type": "message", "msg": msg, "fromUser": pub(users_by_id[c["from"]])}
@@ -1147,18 +1167,20 @@ async def handle_call(user, ws, data):
         if not has_history(uid, to["id"]):  # istenmeyen aramaları önlemek için önce mesajlaşmış olmak gerekir
             await send_to(uid, {"type": "call", "kind": "denied", "callId": cid})
             return
-        calls[cid] = {"from": uid, "to": to["id"], "ts": now_ms(), "answered": None, "sdp": sdp}
-        if not online.get(to["id"]):
-            if not (PUSH_OK and db["push"].get(to["id"])):
-                await finish_call(cid, "unavailable")
-                await send_to(uid, {"type": "call", "kind": "unavailable", "callId": cid})
-                return
-            # Uygulaması kapalı: telefonuna bildirim gider, açarsa arama hâlâ çalıyor (60 sn)
-            spawn(push_to(to["id"], {"t": "call", "title": "📞 @" + user["username"] + " arıyor",
-                                     "body": "Cevaplamak için dokun", "tag": "selam-call"}))
-        else:
+        vid = bool(data.get("video"))
+        calls[cid] = {"from": uid, "to": to["id"], "ts": now_ms(), "answered": None, "sdp": sdp, "video": vid}
+        on = bool(online.get(to["id"]))
+        if not on and not can_push(to["id"]):
+            await finish_call(cid, "unavailable")
+            await send_to(uid, {"type": "call", "kind": "unavailable", "callId": cid})
+            return
+        if on:
             await send_to(to["id"], {"type": "call", "kind": "offer", "callId": cid, "from": uid,
-                                     "fromUser": pub(user), "sdp": sdp})
+                                     "fromUser": pub(user), "sdp": sdp, "video": vid})
+        if can_push(to["id"]) and not visible(to["id"]):
+            # Uygulama kapalı ya da arka planda: telefona bildirim gider, açınca arama çalmaya devam eder (60 sn)
+            spawn(push_to(to["id"], {"t": "call", "title": ("📹 " if vid else "📞 ") + "@" + user["username"] + " arıyor",
+                                     "body": "Cevaplamak için dokun", "tag": "selam-call"}))
         t = asyncio.create_task(ring_timeout(cid))
         bg_tasks.add(t)
         t.add_done_callback(bg_tasks.discard)
@@ -1228,7 +1250,7 @@ async def ws_endpoint(ws: WebSocket):
     for cid, c in list(calls.items()):  # uygulamayı bildirimden açtıysa çalan aramayı göster
         if c["to"] == uid and not c["answered"] and c.get("sdp") and c["from"] in users_by_id:
             await ws.send_text(json.dumps({"type": "call", "kind": "offer", "callId": cid, "from": c["from"],
-                                           "fromUser": pub(users_by_id[c["from"]]), "sdp": c["sdp"]}, ensure_ascii=False))
+                                           "fromUser": pub(users_by_id[c["from"]]), "sdp": c["sdp"], "video": bool(c.get("video"))}, ensure_ascii=False))
 
     bucket, cbucket, window_start = 0, 0, time.time()
     try:
@@ -1311,9 +1333,15 @@ async def ws_endpoint(ws: WebSocket):
                 await send_to(uid, {"type": "message", "msg": msg, "fromUser": pub(user)})
                 if not blocked_me:
                     await send_to(to["id"], {"type": "message", "msg": msg, "fromUser": pub(user)})
-                    if not online.get(to["id"]) and PUSH_OK and db["push"].get(to["id"]):
+                    if can_push(to["id"]) and not visible(to["id"]):
                         prev = (text[:100] or ("📷 Fotoğraf" if img else "📄 " + fl["name"] if fl else "📍 Konum"))
                         spawn(push_to(to["id"], {"t": "msg", "title": "@" + user["username"], "body": prev, "tag": "selam-" + uid}))
+
+            elif kind == "vis":
+                if data.get("v"):
+                    hidden_ws.discard(ws)
+                else:
+                    hidden_ws.add(ws)
 
             elif kind == "react":
                 m = next((x for x in reversed(db["messages"]) if x["id"] == data.get("id")), None)
@@ -1393,6 +1421,7 @@ async def ws_endpoint(ws: WebSocket):
     except Exception as e:
         print("WS hatası:", e, flush=True)
     finally:
+        hidden_ws.discard(ws)
         s = online.get(uid)
         if s:
             s.discard(ws)
