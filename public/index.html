@@ -164,6 +164,15 @@
   .bars i { width: 6px; height: 4px; background: #25d366; border-radius: 3px; transition: height .2s; }
   .cq { color: #f9ab00; min-height: 22px; margin-bottom: 18px; font-size: 14px; }
 
+  .call > div:not(.vidbox) { position: relative; z-index: 1; }
+  #remoteVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; z-index: 0; display: none; }
+  #localVideo { position: absolute; right: 14px; top: calc(14px + env(safe-area-inset-top)); width: 96px; height: 128px; object-fit: cover; border-radius: 10px; z-index: 2; background: #222; display: none; transform: scaleX(-1); box-shadow: 0 2px 10px rgba(0,0,0,.5); }
+  .call.vid #remoteVideo, .call.vid #localVideo { display: block; }
+  .call.vid { align-content: end; padding-bottom: calc(30px + env(safe-area-inset-bottom)); background: #000; }
+  .call.vid .avatar, .call.vid .bars { display: none; }
+  .call.vid .call-name, .call.vid .call-status { text-shadow: 0 1px 6px rgba(0,0,0,.8); }
+  .call.vid .call-status { margin-bottom: 18px; }
+  @media (max-width: 480px) { .cbtn { width: 56px; height: 56px; font-size: 22px; } .call-btns { gap: 12px; } }
   @media (max-width: 720px) {
     .app { grid-template-columns: minmax(0, 1fr); }
     .app.chat-open .side { display: none; }
@@ -225,6 +234,7 @@
       <div class="avatar" id="peerAv"></div>
       <div style="flex:1"><b id="peerName"></b><div class="status" id="peerStatus"></div></div>
       <button class="ibtn" id="callBtn" type="button" title="Sesli ara" aria-label="Sesli ara">📞</button>
+      <button class="ibtn" id="vcallBtn" type="button" title="Görüntülü ara" aria-label="Görüntülü ara">🎥</button>
       <button class="ibtn" id="headMenu" type="button" aria-label="Seçenekler">⋮</button>
     </div>
     <div class="msgs" id="msgs"><div class="placeholder"><img src="/icon-192.png" alt=""><div>Bir sohbet seç ya da yukarıdan arkadaşını ara.</div></div></div>
@@ -246,6 +256,8 @@
 <div class="call hidden" id="call">
   <div><div id="callAv"></div><div class="call-name" id="callName"></div><div class="call-status" id="callStatus"></div><div class="bars" id="bars"></div><div class="cq" id="callQ"></div><div class="call-btns" id="callBtns"></div></div>
   <audio id="remoteAudio" autoplay playsinline></audio>
+  <video id="remoteVideo" class="vidbox" autoplay playsinline muted></video>
+  <video id="localVideo" class="vidbox" autoplay playsinline muted></video>
 </div>
 
 <script>
@@ -328,9 +340,10 @@ function makeAvatar(u, withDot) {
 function fmtDur(s) { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 function callLabel(m) {
   const mine = m.from === user.id, st = m.call.status;
-  if (st === 'ended') return `📞 ${mine ? 'Giden' : 'Gelen'} sesli arama · ${fmtDur(m.call.dur)}`;
-  if (st === 'declined') return mine ? '📞 Arama reddedildi' : '📞 Reddettiğin arama';
-  return mine ? '📞 Cevapsız arama (cevap verilmedi)' : '📵 Cevapsız arama';
+  const ic = m.call.video ? '📹' : '📞', kind = m.call.video ? 'görüntülü arama' : 'sesli arama';
+  if (st === 'ended') return `${ic} ${mine ? 'Giden' : 'Gelen'} ${kind} · ${fmtDur(m.call.dur)}`;
+  if (st === 'declined') return mine ? `${ic} Arama reddedildi` : `${ic} Reddettiğin arama`;
+  return mine ? `${ic} Cevapsız arama (cevap verilmedi)` : '📵 Cevapsız arama';
 }
 function previewOf(m) {
   if (m.del) return 'Bu mesaj silindi';
@@ -459,6 +472,7 @@ function connect() {
   ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
   ws.onopen = () => {
     retry = 0; $('conn').classList.add('hidden');
+    if (document.hidden) wsSend({ type: 'vis', v: false });
     loadChats();
     if (active) { loadMessages(active, true); }
   };
@@ -649,7 +663,10 @@ async function openChat(u, focusId) {
 function closeChat() { active = null; $('app').classList.remove('chat-open'); renderChats(); }
 $('back').onclick = () => { if (history.state && history.state.chat) history.back(); else closeChat(); };
 window.addEventListener('popstate', () => { if (active) closeChat(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden && active) { wsSend({ type: 'read', peer: active.id }); } });
+document.addEventListener('visibilitychange', () => {
+  wsSend({ type: 'vis', v: !document.hidden });
+  if (!document.hidden && active) { wsSend({ type: 'read', peer: active.id }); }
+});
 
 function quoteName(f) { return f === user.id ? 'Sen' : '@' + (active ? active.username : '?'); }
 function picEl(m, done) {
@@ -812,6 +829,7 @@ $('sideMenu').onclick = () => openModal(box => {
     mitem('⭐ Yıldızlı mesajlar', showStarred),
     mitem('🌓 Tema: ' + { auto: 'Otomatik', light: 'Açık', dark: 'Koyu' }[th] + ' (değiştir)', () => { LS.set('selam_theme', { auto: 'light', light: 'dark', dark: 'auto' }[th]); applyTheme(); }),
     mitem(muted() ? '🔕 Bildirim sesi: Kapalı' : '🔔 Bildirim sesi: Açık', () => { LS.set('selam_mute', muted() ? '0' : '1'); toast(muted() ? 'Ses kapatıldı' : 'Ses açıldı'); }),
+    mitem(('Notification' in window && Notification.permission === 'granted') ? '🔔 Bildirimleri dene' : '🔔 Bildirimleri aç', notifMenu),
     mitem('🚫 Engellenenler', showBlocked),
     mitem('↪ Çıkış', doLogout, 'danger'));
 });
@@ -1010,28 +1028,40 @@ function cbtn(cls, icon, caption, fn) {
 function showCall() {
   const c = call; if (!c) return;
   $('call').classList.remove('hidden'); holdScreen(true);
+  $('call').classList.toggle('vid', !!c.video && c.state !== 'ringing');
+  if (c.video && c.stream && $('localVideo').srcObject !== c.stream) $('localVideo').srcObject = c.stream;
   const av = makeAvatar(c.peer, false); $('callAv').replaceChildren(av); $('callName').textContent = '@' + c.peer.username;
-  $('callStatus').textContent = { ringing: 'Seni arıyor…', calling: 'Aranıyor…', connecting: 'Bağlanıyor…', active: '0:00' }[c.state] || '';
+  $('callStatus').textContent = { ringing: c.video ? 'Görüntülü arıyor…' : 'Seni arıyor…', calling: 'Aranıyor…', connecting: 'Bağlanıyor…', active: '0:00' }[c.state] || '';
   const box = $('callBtns'); box.replaceChildren();
   if (c.state === 'ringing') { box.append(cbtn('red', '✕', 'Reddet', () => endCall(true)), cbtn('green', '📞', 'Kabul et', acceptCall)); }
   else {
     box.append(cbtn(c.muted ? 'on' : '', c.muted ? '🔇' : '🎤', c.muted ? 'Açık değil' : 'Sessiz', () => {
       c.muted = !c.muted; (c.stream ? c.stream.getAudioTracks() : []).forEach(t => t.enabled = !c.muted); showCall();
     }));
+    if (c.video) {
+      box.append(cbtn(c.camOff ? 'on' : '', c.camOff ? '🚫' : '📷', c.camOff ? 'Kamera kapalı' : 'Kamera', () => {
+        c.camOff = !c.camOff; (c.stream ? c.stream.getVideoTracks() : []).forEach(t => t.enabled = !c.camOff); showCall();
+      }), cbtn('', '🔄', 'Çevir', flipCam));
+    }
     if (typeof HTMLMediaElement !== 'undefined' && HTMLMediaElement.prototype.setSinkId) box.append(cbtn('', '🔊', 'Ses çıkışı', cycleSink));
     box.append(cbtn('red', '⏹', 'Kapat', () => endCall(true)));
   }
 }
-async function getMic() {
+async function getMic(video) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('Arama için güvenli (https) bağlantı gerekir');
-  try { return await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
-  catch { throw new Error('Mikrofon izni gerekli'); }
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: video ? { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } : false });
+  } catch { throw new Error(video ? 'Kamera ve mikrofon izni gerekli' : 'Mikrofon izni gerekli'); }
 }
 async function makePc(cid) {
   let cfg; try { cfg = await api('/rtc-config'); } catch { cfg = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; }
   const pc = new RTCPeerConnection({ iceServers: cfg.iceServers });
   pc.onicecandidate = e => { if (e.candidate) wsSend({ type: 'call', kind: 'ice', callId: cid, candidate: e.candidate.toJSON() }); };
-  pc.ontrack = e => { const a = $('remoteAudio'); a.srcObject = e.streams[0]; a.play().catch(() => {}); };
+  pc.ontrack = e => {
+    const a = $('remoteAudio'); a.srcObject = e.streams[0]; a.play().catch(() => {});
+    if (e.track.kind === 'video') { const v = $('remoteVideo'); v.srcObject = e.streams[0]; v.play().catch(() => {}); }
+  };
   pc.onconnectionstatechange = () => {
     if (!call || call.pc !== pc) return;
     const s = pc.connectionState;
@@ -1049,6 +1079,16 @@ async function holdScreen(on) {
   } catch {}
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden && call) holdScreen(true); });
+async function flipCam() {
+  const c = call; if (!c || !c.video || !c.pc) return;
+  const next = c.facing === 'environment' ? 'user' : 'environment';
+  try {
+    const ns = await navigator.mediaDevices.getUserMedia({ video: { facingMode: next } }), nt = ns.getVideoTracks()[0];
+    const sender = c.pc.getSenders().find(x => x.track && x.track.kind === 'video'); if (sender) await sender.replaceTrack(nt);
+    c.stream.getVideoTracks().forEach(t => { t.stop(); c.stream.removeTrack(t); }); c.stream.addTrack(nt);
+    c.facing = next; nt.enabled = !c.camOff; const lv = $('localVideo'); lv.srcObject = c.stream; lv.style.transform = next === 'user' ? 'scaleX(-1)' : 'none';
+  } catch { toast('Kamera çevrilemedi'); }
+}
 async function cycleSink() {
   try {
     const ds = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audiooutput');
@@ -1094,23 +1134,24 @@ function endCall(send) {
   if (send) wsSend({ type: 'call', kind: (c.role === 'callee' && c.state === 'ringing') ? 'reject' : 'end', callId: c.id });
   try { c.pc && c.pc.close(); } catch {}
   try { c.stream && c.stream.getTracks().forEach(t => t.stop()); } catch {}
-  $('remoteAudio').srcObject = null; $('call').classList.add('hidden');
+  $('remoteAudio').srcObject = null; $('remoteVideo').srcObject = null; $('localVideo').srcObject = null;
+  $('call').classList.remove('vid'); $('call').classList.add('hidden');
 }
-async function startCall() {
+async function startCall(video) {
   if (call) return toast('Zaten bir aramadasın');
   if (!active) return;
   if (peerBlocked) return toast('Bu kişiyi engelledin. Aramak için engeli kaldır.');
   if (!ws || ws.readyState !== 1) return toast('Bağlantı yok, tekrar deniyor…');
-  const c = call = { id: newCallId(), peer: active, role: 'caller', state: 'calling', pendingIce: [] };
+  const c = call = { id: newCallId(), peer: active, role: 'caller', state: 'calling', video: !!video, pendingIce: [] };
   showCall();
   try {
-    c.stream = await getMic();
+    c.stream = await getMic(c.video);
     if (call !== c) { c.stream.getTracks().forEach(t => t.stop()); return; }
     c.pc = await makePc(c.id);
     c.stream.getTracks().forEach(t => c.pc.addTrack(t, c.stream));
     const offer = await c.pc.createOffer(); await c.pc.setLocalDescription(offer);
     if (call !== c) return;
-    wsSend({ type: 'call', kind: 'offer', callId: c.id, to: c.peer.id, sdp: { type: offer.type, sdp: offer.sdp } });
+    wsSend({ type: 'call', kind: 'offer', callId: c.id, to: c.peer.id, video: !!c.video, sdp: { type: offer.type, sdp: offer.sdp } });
     ring(true, 380, 3000); c.timeout = setTimeout(() => endCall(true), 58000);
   } catch (e) { toast(e.message || 'Arama başlatılamadı'); if (call === c) endCall(false); }
 }
@@ -1118,7 +1159,7 @@ async function acceptCall() {
   const c = call; if (!c || c.state !== 'ringing') return;
   ring(false); clearTimeout(c.timeout); c.state = 'connecting'; showCall();
   try {
-    c.stream = await getMic();
+    c.stream = await getMic(c.video);
     if (call !== c) { c.stream.getTracks().forEach(t => t.stop()); return; }
     c.pc = await makePc(c.id);
     c.stream.getTracks().forEach(t => c.pc.addTrack(t, c.stream));
@@ -1136,9 +1177,9 @@ async function onCallSignal(d) {
   if (k === 'offer') {
     if (call && call.id === d.callId) return;  // aynı arama yeniden iletildi
     if (call) return wsSend({ type: 'call', kind: 'busy', callId: d.callId });
-    const c = call = { id: d.callId, peer: d.fromUser, role: 'callee', state: 'ringing', offer: d.sdp, pendingIce: [] };
+    const c = call = { id: d.callId, peer: d.fromUser, role: 'callee', state: 'ringing', offer: d.sdp, video: !!d.video, pendingIce: [] };
     showCall(); ring(true, 560, 1800);
-    if (document.hidden) notifyText('@' + d.fromUser.username, '📞 Seni arıyor');
+    if (document.hidden) notifyText('@' + d.fromUser.username, d.video ? '📹 Görüntülü arıyor' : '📞 Seni arıyor');
     c.timeout = setTimeout(() => { if (call === c && c.state === 'ringing') endCall(false); }, 60000);
     return;
   }
@@ -1155,10 +1196,19 @@ async function onCallSignal(d) {
     endCall(false);
   }
 }
-$('callBtn').onclick = startCall;
+$('callBtn').onclick = () => startCall(false);
+$('vcallBtn').onclick = () => startCall(true);
 
 // ---------- Bildirim, yükleme önerisi ----------
 // Uygulama kapalıyken bildirim / çalan arama (Web Push). Sunucuda push kapalıysa sessizce atlanır.
+async function notifMenu() {
+  if (!('Notification' in window) || !('serviceWorker' in navigator)) return toast('Bu tarayıcı bildirim desteklemiyor. iPhone\'da önce Paylaş > Ana Ekrana Ekle yap.');
+  if (Notification.permission === 'denied') return toast('Bildirim engelli. Tarayıcı/telefon ayarlarından Selam için bildirime izin ver.');
+  if (Notification.permission !== 'granted') { const r = await Notification.requestPermission(); if (r !== 'granted') return toast('Bildirim izni verilmedi'); }
+  await subscribePush();
+  try { await api('/push/test', {}); toast('Test bildirimi gönderildi. Gelmezse telefonun pil tasarrufu Selam\'ı kısıtlıyor olabilir.'); }
+  catch (e) { toast(e.status === 404 ? 'Bu cihaz kaydedilemedi. Sayfayı yenileyip tekrar dene.' : e.message); }
+}
 async function subscribePush() {
   try {
     if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || Notification.permission !== 'granted') return;
