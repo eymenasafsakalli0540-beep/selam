@@ -439,7 +439,7 @@ async function boot() {
 function start() {
   $('splash').classList.add('hidden'); $('auth').classList.add('hidden'); $('app').classList.remove('hidden');
   $('meName').textContent = '@' + user.username;
-  loadChats(); connect(); setupBanners(); handleInvite().then(handleShare); subscribePush();
+  loadChats(); connect(); setupBanners(); handleInvite().then(handleShare); subscribePush(true);
 }
 // Davet linki: https://site/?u=kullanici -> giriş yapınca o kişiyle sohbet açılır
 async function handleInvite() {
@@ -544,8 +544,12 @@ function handle(d) {
     toast(d.msg);
   } else if (d.type === 'presence') {
     const c = chats.find(x => x.user.id === d.id);
-    if (c) { c.user.online = d.online; c.user.last = d.last; }
-    if (active && active.id === d.id) { active.online = d.online; active.last = d.last; updateStatus(); }
+    if (c) { c.user.online = d.online; c.user.last = d.last; if (d.username) c.user.username = d.username; }
+    if (active && active.id === d.id) {
+      active.online = d.online; active.last = d.last;
+      if (d.username) { active.username = d.username; $('peerName').textContent = '@' + active.username; }
+      updateStatus();
+    }
     renderChats();
   }
 }
@@ -822,9 +826,37 @@ function panel(title, box) {
 function emptyNote(box, text) { const d = document.createElement('div'); d.className = 'empty'; d.textContent = text; box.appendChild(d); }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
+// Kullanıcı adını değiştirme (herkes istediği zaman değiştirebilir)
+function changeUsername() {
+  openModal(box => {
+    panel('Kullanıcı adını değiştir', box);
+    const h = document.createElement('div'); h.className = 'empty'; h.style.padding = '4px 16px 10px';
+    h.textContent = 'Yeni ad 3-20 karakter olmalı: harf, rakam, alt çizgi. Türkçe harfler sadeleşir (ş → s, ı → i). Arkadaşların seni yeni adla bulur.';
+    const inp = document.createElement('input');
+    inp.value = user.username || ''; inp.maxLength = 20; inp.autocomplete = 'off'; inp.autocapitalize = 'none';
+    inp.style.cssText = 'margin:4px 16px;padding:12px 14px;border-radius:12px;border:1px solid #d7dbdf;font:inherit;background:#fff;color:#111';
+    const err = document.createElement('div'); err.className = 'err'; err.style.margin = '0 16px 4px';
+    const btn = document.createElement('button'); btn.className = 'btn'; btn.type = 'button'; btn.textContent = 'Kaydet';
+    btn.style.margin = '6px 16px 16px';
+    const kaydet = async () => {
+      err.textContent = ''; btn.disabled = true;
+      try {
+        const u = await api('/me/username', { username: inp.value.replace(/^@/, '').trim() });
+        user.username = u.username; $('meName').textContent = '@' + user.username;
+        closeModal(); toast('Kullanıcı adın @' + user.username + ' oldu'); loadChats();
+      } catch (e) { err.textContent = e.message; btn.disabled = false; }
+    };
+    btn.onclick = kaydet;
+    inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); kaydet(); } };
+    box.append(h, inp, err, btn);
+    setTimeout(() => { try { inp.focus(); inp.select(); } catch {} }, 80);
+  });
+}
+
 $('sideMenu').onclick = () => openModal(box => {
   const th = LS.get('selam_theme') || 'auto';
   box.append(
+    mitem('✏️ Kullanıcı adımı değiştir (@' + user.username + ')', changeUsername),
     mitem('🔗 Davet linkim', inviteShare),
     mitem('⭐ Yıldızlı mesajlar', showStarred),
     mitem('🌓 Tema: ' + { auto: 'Otomatik', light: 'Açık', dark: 'Koyu' }[th] + ' (değiştir)', () => { LS.set('selam_theme', { auto: 'light', light: 'dark', dark: 'auto' }[th]); applyTheme(); }),
@@ -1206,19 +1238,32 @@ async function notifMenu() {
   if (Notification.permission === 'denied') return toast('Bildirim engelli. Tarayıcı/telefon ayarlarından Selam için bildirime izin ver.');
   if (Notification.permission !== 'granted') { const r = await Notification.requestPermission(); if (r !== 'granted') return toast('Bildirim izni verilmedi'); }
   await subscribePush();
-  try { await api('/push/test', {}); toast('Test bildirimi gönderildi. Gelmezse telefonun pil tasarrufu Selam\'ı kısıtlıyor olabilir.'); }
+  let cihaz = null;
+  try { const st = await api('/push/status'); cihaz = st.cihaz; } catch {}
+  try { await api('/push/test', {}); toast('Test bildirimi gönderildi' + (cihaz ? ' — bu hesapta ' + cihaz + ' cihaz kayıtlı' : '') + '. Gelmezse pil tasarrufunu ve bildirim iznini kontrol et.'); }
   catch (e) { toast(e.status === 404 ? 'Bu cihaz kaydedilemedi. Sayfayı yenileyip tekrar dene.' : e.message); }
 }
-async function subscribePush() {
+let pushUyariGosterildi = false;
+async function subscribePush(sessiz) {
   try {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || Notification.permission !== 'granted') return;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || Notification.permission !== 'granted') return false;
     const reg = await navigator.serviceWorker.ready, k = await api('/push/key');
     const b64 = (k.key + '='.repeat((4 - k.key.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/');
     const key = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
     let sub = await reg.pushManager.getSubscription();
     if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
     await api('/push/subscribe', { sub: sub.toJSON() });
-  } catch {}
+    return true;
+  } catch (e) {
+    if (!sessiz && !pushUyariGosterildi) {
+      pushUyariGosterildi = true;
+      const iphone = /iphone|ipad|ipod/i.test(navigator.userAgent) && !matchMedia('(display-mode: standalone)').matches;
+      toast(iphone
+        ? 'iPhone\'da bildirim için: Paylaş ▸ "Ana Ekrana Ekle" yapıp uygulamayı ana ekrandan aç.'
+        : 'Bildirim kaydı yapılamadı: ' + ((e && e.message) || e));
+    }
+    return false;
+  }
 }
 function notify(u, m) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
@@ -1241,7 +1286,7 @@ function setupBanners() {
   $('banners').innerHTML = '';
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
   if ('Notification' in window && Notification.permission === 'default')
-    addBanner('Uygulama kapalıyken de mesaj ve aramalar için bildirim alalım mı?', 'Aç', () => Notification.requestPermission().then(subscribePush), 'notif');
+    addBanner('Uygulama kapalıyken de mesaj ve aramalar için bildirim alalım mı?', 'Aç', () => Notification.requestPermission().then(r => { if (r === 'granted') subscribePush(); }), 'notif');
   if (!standalone) {
     if (installEvt) addBanner('Selam\'ı uygulama olarak yükle.', 'Yükle', () => installEvt.prompt(), 'install');
     else if (/iphone|ipad|ipod/i.test(navigator.userAgent)) addBanner('iPhone\'a yüklemek için Paylaş ▸ "Ana Ekrana Ekle" de.', null, null, 'ios');
@@ -1255,7 +1300,10 @@ try {
   const sp = new URLSearchParams(location.search), shared = [sp.get('title'), sp.get('text'), sp.get('url')].filter(Boolean).join('\n');
   if (shared) { LS.set('selam_share', shared.slice(0, 3000)); history.replaceState(null, '', location.pathname); }
 } catch {}
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').then(r => { swReg = r; }).catch(() => {});
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(r => { swReg = r; }).catch(() => {});
+  navigator.serviceWorker.addEventListener('message', e => { if (e.data && e.data.type === 'resub') subscribePush(true); });
+}
 boot();
 </script>
 </body>
