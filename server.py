@@ -1214,15 +1214,17 @@ async def handle_call(user, ws, data):
             await send_to(uid, {"type": "call", "kind": "denied", "callId": cid})
             return
         vid = bool(data.get("video"))
-        calls[cid] = {"from": uid, "to": to["id"], "ts": now_ms(), "answered": None, "sdp": sdp, "video": vid}
+        calls[cid] = {"from": uid, "to": to["id"], "ts": now_ms(), "answered": None, "sdp": sdp,
+                      "video": vid, "ice_from": [], "ice_to": []}
         on = bool(online.get(to["id"]))
-        if not on and not can_push(to["id"]):
-            await finish_call(cid, "unavailable")
-            await send_to(uid, {"type": "call", "kind": "unavailable", "callId": cid})
-            return
+        # Kişi çevrimdışıyken artık aramayı reddetmiyoruz: çağrı 60 sn boyunca bekler.
+        # Uygulamayı açtığında (veya bildirime dokunduğunda) ws_endpoint bekleyen aramayı
+        # kendisine iletir; ICE adayları da saklanıp gönderilir → bağlantı kurulabilir.
         if on:
             await send_to(to["id"], {"type": "call", "kind": "offer", "callId": cid, "from": uid,
                                      "fromUser": pub(user), "sdp": sdp, "video": vid})
+        else:
+            await send_to(uid, {"type": "call", "kind": "waiting", "callId": cid})
         if can_push(to["id"]):
             yuk = {"t": "call", "title": ("📹 " if vid else "📞 ") + "@" + user["username"] + " arıyor",
                    "body": "Cevaplamak için dokun", "tag": "selam-call"}
@@ -1249,7 +1251,12 @@ async def handle_call(user, ws, data):
     elif ck == "ice":
         cand = data.get("candidate")
         if isinstance(cand, dict) and len(json.dumps(cand)) < 2000:
-            await send_to(other, {"type": "call", "kind": "ice", "callId": cid, "candidate": cand})
+            payload = {"type": "call", "kind": "ice", "callId": cid, "candidate": cand}
+            if online.get(other):
+                await send_to(other, payload)
+            else:
+                # Karşı taraf çevrimdışı: adayı sakla, uygulamayı açtığında gönder.
+                c.setdefault("ice_from" if uid == c["from"] else "ice_to", []).append(cand)
     else:  # end / reject / busy
         await finish_call(cid, ck, by=uid)
         await send_to(other, {"type": "call", "kind": ck, "callId": cid})
@@ -1298,10 +1305,12 @@ async def ws_endpoint(ws: WebSocket):
             await send_to(sid, {"type": "delivered", "ids": ids})
     if first:
         await broadcast_presence(user)
-    for cid, c in list(calls.items()):  # uygulamayı bildirimden açtıysa çalan aramayı göster
+    for cid, c in list(calls.items()):  # uygulamayı bildirimden açtıysa / çevrimdışıyken arandıysa çalan aramayı göster
         if c["to"] == uid and not c["answered"] and c.get("sdp") and c["from"] in users_by_id:
             await ws.send_text(json.dumps({"type": "call", "kind": "offer", "callId": cid, "from": c["from"],
                                            "fromUser": pub(users_by_id[c["from"]]), "sdp": c["sdp"], "video": bool(c.get("video"))}, ensure_ascii=False))
+            for cand in c.get("ice_from", []):  # arayan kişi bu arada topladıysa ICE adayları
+                await ws.send_text(json.dumps({"type": "call", "kind": "ice", "callId": cid, "candidate": cand}, ensure_ascii=False))
 
     bucket, cbucket, window_start = 0, 0, time.time()
     try:
