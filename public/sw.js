@@ -1,4 +1,4 @@
-const V = 'selam-v2';
+const V = 'selam-v3';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -29,4 +29,10 @@ self.addEventListener('push', e => {
     body: d.body || '', icon: '/icon-192.png', badge: '/icon-192.png', tag: d.tag || 'selam', renotify: true,
     requireInteraction: call, vibrate: call ? [400, 200, 400, 200, 400] : [120],
   }));
+});
+
+// Abonelik tarayıcı tarafından yenilenirse açık sekmeye haber ver, o da sunucuya tekrar kaydetsin.
+self.addEventListener('pushsubscriptionchange', e => {
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+    .then(cs => cs.forEach(c => c.postMessage({ type: 'resub' }))));
 });
