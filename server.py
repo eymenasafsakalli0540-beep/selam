@@ -622,16 +622,21 @@ async def api_me(request: Request):
 
 @app.post("/api/me/username")
 async def set_username(request: Request):
+    """Kullanıcı adını belirler veya değiştirir. Herkes istediği zaman değiştirebilir."""
     user = require_auth(request)
     data = await body_of(request)
-    name = str(data.get("username") or "").strip().lower()
+    raw = str(data.get("username") or "").strip().lstrip("@")
+    # Türkçe harfleri sadeleştir: "Eymen" -> "eymen", "ışık" -> "isik"
+    name = re.sub(r"\s+", "_", raw.translate(_TR).lower())
     if not re.fullmatch(r"[a-z0-9_]{3,20}", name):
-        raise HTTPException(400, "3-20 karakter: harf, rakam, alt çizgi")
+        raise HTTPException(400, "3-20 karakter olmalı: harf, rakam, alt çizgi (ş→s, ı→i, ğ→g)")
     if any(u["username"] == name and u["id"] != user["id"] for u in db["users"]):
-        raise HTTPException(409, "Bu kullanıcı adı alınmış")
-    user["username"] = name
-    mark()
-    await flush()
+        raise HTTPException(409, "Bu kullanıcı adı alınmış, başka bir tane dene")
+    if (user.get("username") or "") != name:
+        user["username"] = name
+        mark()
+        await broadcast_presence(user)  # açık sohbetlerde isim hemen güncellensin
+        await flush()
     return me(user)
 
 
@@ -1002,10 +1007,20 @@ async def push_to(uid, payload: dict):
         return
     data = json.dumps(payload, ensure_ascii=False)
     keys = db["vapid"]
+    # Arama: hemen çalsın (45 sn). Mesaj: telefon kapalı/uykuda olsa bile 24 saat sonra
+    # açıldığında gelsin diye uzun TTL (eski hâli 60 sn idi, bu yüzden bildirimler kayboluyordu).
+    arama = payload.get("t") == "call"
+    ttl = 45 if arama else 86400
+    hdr = {"Urgency": "high" if arama else "normal"}
 
     def one(sub):
         try:
-            webpush(subscription_info=sub, data=data, vapid_private_key=keys["priv"], vapid_claims={"sub": VAPID_SUB}, ttl=60)
+            try:
+                webpush(subscription_info=sub, data=data, vapid_private_key=keys["priv"],
+                        vapid_claims={"sub": VAPID_SUB}, ttl=ttl, headers=hdr, timeout=15)
+            except TypeError:  # eski pywebpush sürümü: headers/timeout parametresi yok
+                webpush(subscription_info=sub, data=data, vapid_private_key=keys["priv"],
+                        vapid_claims={"sub": VAPID_SUB}, ttl=ttl)
             return True
         except WebPushException as e:
             st = getattr(getattr(e, "response", None), "status_code", None)
@@ -1039,12 +1054,42 @@ def spawn(coro):
     t.add_done_callback(bg_tasks.discard)
 
 
+async def push_gecikmeli(uid, msg, payload, gecikme=5):
+    """Mesaj birkaç saniye içinde okunmazsa bildirim gönder.
+
+    Uygulama açık görünse bile telefon kilitliyken tarayıcı 'gizli' demeyebiliyor;
+    bu yüzden 'görünür' olsa da okunmayan mesaj için bildirim yolluyoruz.
+    """
+    await asyncio.sleep(gecikme)
+    if msg.get("rd") or msg.get("del"):
+        return
+    await push_to(uid, payload)
+
+
+async def arama_push_gecikmeli(cid, uid, payload, gecikme=6):
+    """Arama 6 sn içinde cevaplanmazsa telefona bildirim gönder (kilitli ekran için)."""
+    await asyncio.sleep(gecikme)
+    c = calls.get(cid)
+    if not c or c.get("answered"):
+        return
+    await push_to(uid, payload)
+
+
 @app.get("/api/push/key")
 async def push_key(request: Request):
     require_auth(request)
     if not PUSH_OK:
         raise HTTPException(404, "Push kapalı")
     return {"key": db["vapid"]["pub"]}
+
+
+@app.get("/api/push/status")
+async def push_status(request: Request):
+    """Bu hesaba kayıtlı bildirim cihazlarını döner (bildirim gelmiyorsa sebebini görmek için)."""
+    user = require_auth(request)
+    subs = db["push"].get(user["id"]) or []
+    return {"ok": True, "push_ok": PUSH_OK, "cihaz": len(subs),
+            "sunucular": sorted({urllib.parse.urlparse(s.get("endpoint", "")).hostname or "?" for s in subs})}
 
 
 @app.post("/api/push/subscribe")
@@ -1108,7 +1153,8 @@ def contacts_of(uid):
 
 
 async def broadcast_presence(user):
-    payload = {"type": "presence", "id": user["id"], "online": bool(online.get(user["id"])), "last": user.get("last")}
+    payload = {"type": "presence", "id": user["id"], "username": user.get("username") or "",
+               "online": bool(online.get(user["id"])), "last": user.get("last")}
     for pid in contacts_of(user["id"]):
         await send_to(pid, payload)
 
@@ -1177,10 +1223,15 @@ async def handle_call(user, ws, data):
         if on:
             await send_to(to["id"], {"type": "call", "kind": "offer", "callId": cid, "from": uid,
                                      "fromUser": pub(user), "sdp": sdp, "video": vid})
-        if can_push(to["id"]) and not visible(to["id"]):
-            # Uygulama kapalı ya da arka planda: telefona bildirim gider, açınca arama çalmaya devam eder (60 sn)
-            spawn(push_to(to["id"], {"t": "call", "title": ("📹 " if vid else "📞 ") + "@" + user["username"] + " arıyor",
-                                     "body": "Cevaplamak için dokun", "tag": "selam-call"}))
+        if can_push(to["id"]):
+            yuk = {"t": "call", "title": ("📹 " if vid else "📞 ") + "@" + user["username"] + " arıyor",
+                   "body": "Cevaplamak için dokun", "tag": "selam-call"}
+            if visible(to["id"]):
+                # Uygulama açık görünüyor: önce orada çalsın, cevaplanmazsa telefona bildirim gitsin
+                spawn(arama_push_gecikmeli(cid, to["id"], yuk))
+            else:
+                # Uygulama kapalı/arka planda: telefona bildirim gider, açınca arama çalmaya devam eder (60 sn)
+                spawn(push_to(to["id"], yuk))
         t = asyncio.create_task(ring_timeout(cid))
         bg_tasks.add(t)
         t.add_done_callback(bg_tasks.discard)
@@ -1333,9 +1384,13 @@ async def ws_endpoint(ws: WebSocket):
                 await send_to(uid, {"type": "message", "msg": msg, "fromUser": pub(user)})
                 if not blocked_me:
                     await send_to(to["id"], {"type": "message", "msg": msg, "fromUser": pub(user)})
-                    if can_push(to["id"]) and not visible(to["id"]):
+                    if can_push(to["id"]):
                         prev = (text[:100] or ("📷 Fotoğraf" if img else "📄 " + fl["name"] if fl else "📍 Konum"))
-                        spawn(push_to(to["id"], {"t": "msg", "title": "@" + user["username"], "body": prev, "tag": "selam-" + uid}))
+                        yuk = {"t": "msg", "title": "@" + user["username"], "body": prev, "tag": "selam-" + uid}
+                        if visible(to["id"]):
+                            spawn(push_gecikmeli(to["id"], msg, yuk))  # okuyan kullanıcıya boşuna bildirim gitmesin
+                        else:
+                            spawn(push_to(to["id"], yuk))
 
             elif kind == "vis":
                 if data.get("v"):
