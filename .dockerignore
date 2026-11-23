@@ -1,0 +1,11 @@
+.env
+.env.*
+data.json
+data.json.*
+uploads/
+__pycache__/
+*.pyc
+.git/
+.github/
+*.bat
+render.yaml
