@@ -16,6 +16,139 @@ const fail = (message, status = 400) => json({ error: message }, status);
 const uid = () => crypto.randomUUID().replaceAll('-', '');
 const now = () => Date.now();
 const chatKey = (a, b) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+const enc = new TextEncoder();
+
+// ---------- Web Push (kapalı sekme / kapalı uygulama) ----------
+const b64u = (input) => {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+const unb64u = (value) => {
+  const b64 = String(value).replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(b64 + '='.repeat((4 - b64.length % 4) % 4));
+  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+};
+const concat = (...arrays) => {
+  const out = new Uint8Array(arrays.reduce((n, a) => n + a.length, 0));
+  let offset = 0;
+  for (const a of arrays) { out.set(a, offset); offset += a.length; }
+  return out;
+};
+
+async function hkdfExtract(salt, ikm) {
+  const key = await crypto.subtle.importKey('raw', salt, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, ikm));
+}
+async function hkdfExpand(prk, info, length) {
+  const key = await crypto.subtle.importKey('raw', prk, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const input = new Uint8Array(info.length + 1);
+  input.set(info);
+  input[info.length] = 1;
+  const out = new Uint8Array(await crypto.subtle.sign('HMAC', key, input));
+  return out.slice(0, length);
+}
+async function hkdf(salt, ikm, info, length) {
+  return hkdfExpand(await hkdfExtract(salt, ikm), info, length);
+}
+
+async function vapidKeys(env) {
+  const raw = await env.KV.get('push:vapid');
+  if (raw) return JSON.parse(raw);
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const keys = {
+    pub: b64u(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey))),
+    priv: b64u(new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey))),
+  };
+  await env.KV.put('push:vapid', JSON.stringify(keys));
+  return keys;
+}
+
+async function pushJwt(privateKeyB64, endpoint) {
+  const key = await crypto.subtle.importKey('pkcs8', unb64u(privateKeyB64), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const header = b64u(enc.encode(JSON.stringify({ alg: 'ES256', typ: 'JWT' })));
+  const payload = b64u(enc.encode(JSON.stringify({
+    aud: new URL(endpoint).origin,
+    exp: Math.floor(Date.now() / 1000) + 12 * 3600,
+    sub: 'mailto:eymenasafsakalli0540@gmail.com',
+  })));
+  const signature = new Uint8Array(await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(`${header}.${payload}`)
+  ));
+  return `${header}.${payload}.${b64u(signature)}`;
+}
+
+async function encryptPushPayload(sub, plain) {
+  const uaPublic = unb64u(sub.keys.p256dh);
+  const auth = unb64u(sub.keys.auth);
+  const ephemeral = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const uaKey = await crypto.subtle.importKey('raw', uaPublic, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, ephemeral.privateKey, 256));
+  const serverPublic = new Uint8Array(await crypto.subtle.exportKey('raw', ephemeral.publicKey));
+
+  const info = concat(enc.encode('WebPush: info\0'), uaPublic, serverPublic);
+  const cekKey = await hkdf(auth, shared, info, 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const prk = await hkdfExtract(salt, cekKey);
+  const cek = await hkdfExpand(prk, enc.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await hkdfExpand(prk, enc.encode('Content-Encoding: nonce\0'), 12);
+
+  const aesKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aesKey, enc.encode(plain)));
+  const recordSize = new Uint8Array(4);
+  new DataView(recordSize.buffer).setUint32(0, 4096, false);
+  return concat(salt, recordSize, new Uint8Array([serverPublic.length]), serverPublic, cipher);
+}
+
+async function sendPush(env, userId, data) {
+  const list = await env.KV.list({ prefix: `push:${userId}:` });
+  if (!list.keys.length) return 0;
+  const vapid = await vapidKeys(env);
+  const plain = JSON.stringify(data);
+  let sent = 0;
+  for (const item of list.keys) {
+    const raw = await env.KV.get(item.name);
+    if (!raw) continue;
+    let sub;
+    try { sub = JSON.parse(raw); } catch { await env.KV.delete(item.name); continue; }
+    try {
+      const [body, jwt] = await Promise.all([
+        encryptPushPayload(sub, plain),
+        pushJwt(vapid.priv, sub.endpoint),
+      ]);
+      const response = await fetch(sub.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Encoding': 'aes128gcm',
+          Authorization: `WebPush ${jwt}`,
+          TTL: '120',
+          Urgency: data.t === 'call' ? 'high' : 'normal',
+        },
+        body,
+      });
+      if (response.status === 404 || response.status === 410) await env.KV.delete(item.name);
+      else if (response.ok) sent++;
+    } catch (e) {
+      if (/invalid|404|410|unsubscribe/i.test(String(e && e.message))) await env.KV.delete(item.name);
+    }
+  }
+  return sent;
+}
+
+function pushPreview(msg) {
+  if (msg.del) return 'Mesaj silindi';
+  if (msg.img) return '📷 Fotoğraf';
+  if (msg.file) return '📎 Dosya';
+  if (msg.loc) return '📍 Konum';
+  return String(msg.text || '').slice(0, 120) || 'Yeni mesaj';
+}
+
+async function subKey(userId, endpoint) {
+  const hash = await crypto.subtle.digest('SHA-256', enc.encode(String(endpoint)));
+  return `push:${userId}:${b64u(new Uint8Array(hash))}`;
+}
 
 async function bodyOf(request) {
   const type = request.headers.get('content-type') || '';
@@ -273,9 +406,38 @@ async function api(request, env, url) {
     return json({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   }
 
-  if (path === 'push/status' && request.method === 'GET') return json({ cihaz: 0 });
-  if (path === 'push/key' && request.method === 'GET') return json({ key: 'kartsiz-surum' });
-  if (path.startsWith('push/') && request.method === 'POST') return json({ ok: true });
+  if (path === 'push/status' && request.method === 'GET') {
+    const list = await env.KV.list({ prefix: `push:${user.id}:` });
+    return json({ cihaz: list.keys.length });
+  }
+
+  if (path === 'push/key' && request.method === 'GET') {
+    const keys = await vapidKeys(env);
+    return json({ key: keys.pub });
+  }
+
+  if (path === 'push/subscribe' && request.method === 'POST') {
+    const { sub } = await bodyOf(request);
+    if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return fail('Geçersiz bildirim aboneliği.', 400);
+    await env.KV.put(await subKey(user.id, sub.endpoint), JSON.stringify({
+      endpoint: sub.endpoint, keys: sub.keys, userId: user.id,
+    }));
+    return json({ ok: true });
+  }
+
+  if (path === 'push/unsubscribe' && request.method === 'POST') {
+    const { endpoint } = await bodyOf(request);
+    if (endpoint) await env.KV.delete(await subKey(user.id, endpoint));
+    return json({ ok: true });
+  }
+
+  if (path === 'push/test' && request.method === 'POST') {
+    const sent = await sendPush(env, user.id, {
+      title: 'Selam', body: 'Bildirim testi ✅', tag: 'selam-test', t: 'test',
+    });
+    if (!sent) return fail('Bu cihaz kaydedilemedi. Sayfayı yenileyip tekrar dene.', 404);
+    return json({ ok: true, gonderilen: sent });
+  }
 
   return fail('Bulunamadı.', 404);
 }
@@ -376,7 +538,16 @@ export class ChatRoom {
     }
 
     if (d.type === 'call' && d.to) {
-      this.sendTo(d.to, { ...d, from: me });
+      if (this.socketsOf(d.to).length) {
+        this.sendTo(d.to, { ...d, from: me });
+      } else {
+        await sendPush(this.env, d.to, {
+          title: '@' + (user.username || 'Selam'),
+          body: d.video ? '📹 Seni arıyor' : '📞 Seni arıyor',
+          tag: 'selam-call', t: 'call',
+        });
+        this.sendTo(me, { type: 'call', kind: 'waiting', callId: d.callId });
+      }
       return;
     }
 
@@ -410,7 +581,16 @@ export class ChatRoom {
       const packet = { type: 'message', msg, fromUser };
       this.sendTo(d.to, packet);
       this.sendTo(me, packet);
-      if (this.socketsOf(d.to).length) this.sendTo(me, { type: 'delivered', ids: [msg.id] });
+      if (this.socketsOf(d.to).length) {
+        this.sendTo(me, { type: 'delivered', ids: [msg.id] });
+      } else {
+        await sendPush(this.env, d.to, {
+          title: '@' + (fromUser.username || 'Selam'),
+          body: pushPreview(msg),
+          tag: 'selam-' + me,
+          t: 'message',
+        });
+      }
       return;
     }
 
