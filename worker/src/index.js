@@ -188,7 +188,17 @@ async function api(request, env, url) {
 
   let m;
   if ((m = path.match(/^messages\/([^/]+)$/)) && request.method === 'GET') {
-    return json(await getChat(env, user.id, m[1]));
+    const peerId = m[1];
+    const chat = await getChat(env, user.id, peerId);
+    const rawBlocks = await env.KV.get(`blocks:${user.id}`);
+    const blocks = rawBlocks ? JSON.parse(rawBlocks) : [];
+    const rawPeerBlocks = await env.KV.get(`blocks:${peerId}`);
+    const peerBlocks = rawPeerBlocks ? JSON.parse(rawPeerBlocks) : [];
+    return json({
+      messages: chat,
+      blocked: blocks.includes(peerId) || peerBlocks.includes(user.id),
+      peer: await publicUser(env, peerId),
+    });
   }
 
   if (path === 'search/messages' && request.method === 'GET') {
